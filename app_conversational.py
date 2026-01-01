@@ -3,6 +3,8 @@ import json
 import uuid
 from datetime import datetime
 from typing import Dict, Any, Optional
+from zoho_auth import get_access_token
+
 
 from flask import Flask, request, jsonify
 import requests
@@ -52,8 +54,8 @@ def send_quick_replies(psid: str, text: str, replies: Dict[str, str]) -> None:
 def create_bigin_record(payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{ZOHO_BASE}/{ZOHO_MODULE}"
     headers = {
-        "Authorization": f"Zoho-oauthtoken {ZOHO_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
+       "Authorization": f"Zoho-oauthtoken {get_access_token()}",
+       "Content-Type": "application/json"
     }
     body = {"data": [payload]}
     try:
