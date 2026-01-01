@@ -5,16 +5,26 @@ services:
     plan: starter
     buildCommand: "pip install -r requirements.txt"
     startCommand: "gunicorn app_conversational:app --preload -w 2 -b 0.0.0.0:$PORT"
+
     envVars:
       - key: FB_PAGE_ACCESS_TOKEN
         sync: false
       - key: FB_VERIFY_TOKEN
         sync: false
-      - key: ZOHO_ACCESS_TOKEN
+
+      - key: ZOHO_CLIENT_ID
         sync: false
+      - key: ZOHO_CLIENT_SECRET
+        sync: false
+      - key: ZOHO_REFRESH_TOKEN
+        sync: false
+      - key: ZOHO_DC
+        sync: false
+
       - key: ZOHO_BIGIN_BASE
         value: https://www.zohoapis.com/bigin/v2
       - key: ZOHO_BIGIN_MODULE
         value: Leads
+
       - key: PYTHONUNBUFFERED
         value: "1"
