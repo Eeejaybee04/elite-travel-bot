@@ -55,19 +55,45 @@ def send_quick_replies(psid: str, text: str, replies: Dict[str, str]) -> None:
     ]
     send_message(psid, text, quick_replies=qrs)
 
-
 def create_bigin_record(payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{ZOHO_BASE}/{ZOHO_MODULE}"
-    headers = {
-       "Authorization": f"Zoho-oauthtoken {get_access_token()}",
-       "Content-Type": "application/json"
-    }
     body = {"data": [payload]}
+
+    def _headers():
+        return {
+            "Authorization": f"Zoho-oauthtoken {get_access_token()}",
+            "Content-Type": "application/json"
+        }
+
     try:
-        resp = requests.post(url, headers=headers, json=body, timeout=20)
-        return {"status_code": resp.status_code, "body": resp.json()}
-    except Exception as e:
-        return {"status_code": 0, "error": str(e)}
+        resp = requests.post(url, headers=_headers(), json=body, timeout=20)
+
+        # If token expired mid-request, refresh & retry once
+        if resp.status_code in (401, 403):
+            print("[Zoho] Token rejected, retrying once with fresh token")
+            resp = requests.post(url, headers=_headers(), json=body, timeout=20)
+
+        # Try to parse JSON safely
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw_text": resp.text}
+
+        if resp.status_code >= 400:
+            print(f"[Zoho ERROR] {resp.status_code}: {data}")
+
+        return {
+            "status_code": resp.status_code,
+            "body": data
+        }
+
+    except requests.RequestException as e:
+        print(f"[Zoho EXCEPTION] {str(e)}")
+        return {
+            "status_code": 0,
+            "error": str(e)
+        }
+
 
 
 def fetch_exact_price(origin: str, dest: str, depart_date: str, return_date: Optional[str],
