@@ -15,6 +15,11 @@ app = Flask(__name__)
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True})
+@app.route("/zoho/token-check", methods=["GET"])
+def zoho_token_check():
+    token = get_access_token()
+    return jsonify({"token_loaded": bool(token)})
+
 
 
 # ---------------- CONFIG ----------------
