@@ -10,6 +10,10 @@ import requests
 from pricing_rules import compute_pricing
 
 app = Flask(__name__)
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True})
+
 
 # ---------------- CONFIG ----------------
 PAGE_ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN", "REPLACE_ME")
