@@ -1,3 +1,4 @@
+# app_conversational.py
 import os
 import json
 import uuid
@@ -13,9 +14,26 @@ from pricing_rules import compute_pricing
 app = Flask(__name__)
 
 # =========================================================
-# HEALTH & TEST ROUTES
+# CONFIG (Render Environment Variables)
 # =========================================================
+PAGE_ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN", "REPLACE_ME")
+VERIFY_TOKEN = os.getenv("FB_VERIFY_TOKEN", "REPLACE_ME")
 
+ZOHO_BASE = os.getenv("ZOHO_BIGIN_BASE", "https://www.zohoapis.com/bigin/v2")
+
+CONVENIENCE_FEE_PCT = float(os.getenv("CONVENIENCE_FEE_PCT", "0.088"))
+COMMISSION_MAP = {"626": 0.025, "656": 0.05}  # Air Niugini, PNG Air
+
+# Optional: comma-separated Zoho user IDs for owner assignment
+# Example: ZOHO_AGENT_IDS="4553...111,4553...222"
+AGENT_IDS = [x.strip() for x in os.getenv("ZOHO_AGENT_IDS", "").split(",") if x.strip()]
+
+# In-memory sessions (use Redis later if you want persistence across restarts)
+SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+# =========================================================
+# HEALTH / TEST ROUTES
+# =========================================================
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True})
@@ -26,36 +44,13 @@ def zoho_token_check():
     return jsonify({"token_loaded": bool(token)})
 
 # =========================================================
-# CONFIG
+# MESSENGER SEND API (real send)
 # =========================================================
-
-PAGE_ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN", "REPLACE_ME")
-VERIFY_TOKEN = os.getenv("FB_VERIFY_TOKEN", "REPLACE_ME")
-
-ZOHO_BASE = os.getenv("ZOHO_BIGIN_BASE", "https://www.zohoapis.com/bigin/v2")
-
-CONVENIENCE_FEE_PCT = float(os.getenv("CONVENIENCE_FEE_PCT", "0.088"))
-COMMISSION_MAP = {"626": 0.025, "656": 0.05}  # Air Niugini, PNG Air
-
-# Agents (optional): comma-separated Zoho user IDs in Render env var
-# Example: ZOHO_AGENT_IDS="4553...111,4553...222"
-AGENT_IDS = [x.strip() for x in os.getenv("ZOHO_AGENT_IDS", "").split(",") if x.strip()]
-
-# In-memory stores (replace with Redis later)
-SESSIONS: Dict[str, Dict[str, Any]] = {}
-QUOTES: Dict[str, Dict[str, Any]] = {}
-
-# =========================================================
-# MESSENGER HELPERS
-# =========================================================
-
 def _messenger_post(payload: dict) -> None:
-    """
-    Sends a payload to Messenger Send API if PAGE_ACCESS_TOKEN is set.
-    If token is REPLACE_ME, it only logs.
-    """
     print(f"[Messenger SEND] {json.dumps(payload, indent=2)}")
+
     if not PAGE_ACCESS_TOKEN or PAGE_ACCESS_TOKEN == "REPLACE_ME":
+        print("[Messenger WARN] FB_PAGE_ACCESS_TOKEN not set. Not sending to Facebook.")
         return
 
     url = f"https://graph.facebook.com/v18.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
@@ -73,27 +68,11 @@ def send_message(psid: str, text: str) -> None:
 # =========================================================
 # ZOHO HELPERS
 # =========================================================
-
 def zoho_headers():
     return {
         "Authorization": f"Zoho-oauthtoken {get_access_token()}",
         "Content-Type": "application/json"
     }
-
-# ---------- LEADS ----------
-
-def find_lead_by_phone(phone: str) -> Optional[dict]:
-    """
-    Search leads by Mobile equals phone.
-    """
-    url = f"{ZOHO_BASE}/Leads/search"
-    params = {"criteria": f"(Mobile:equals:{phone})"}
-    r = requests.get(url, headers=zoho_headers(), params=params, timeout=20)
-    if r.status_code == 200:
-        j = r.json()
-        if j.get("data"):
-            return j["data"][0]
-    return None
 
 def split_name(full_name: str) -> Tuple[str, str]:
     parts = (full_name or "").strip().split()
@@ -102,6 +81,16 @@ def split_name(full_name: str) -> Tuple[str, str]:
     if len(parts) == 1:
         return "", parts[0]  # Zoho requires Last_Name
     return " ".join(parts[:-1]), parts[-1]
+
+def find_lead_by_phone(phone: str) -> Optional[dict]:
+    url = f"{ZOHO_BASE}/Leads/search"
+    params = {"criteria": f"(Mobile:equals:{phone})"}
+    r = requests.get(url, headers=zoho_headers(), params=params, timeout=20)
+    if r.status_code == 200:
+        j = r.json()
+        if j.get("data"):
+            return j["data"][0]
+    return None
 
 def upsert_lead(full_name: str, phone: str, psid: str) -> str:
     existing = find_lead_by_phone(phone)
@@ -118,7 +107,9 @@ def upsert_lead(full_name: str, phone: str, psid: str) -> str:
     if existing:
         lead_id = existing["id"]
         url = f"{ZOHO_BASE}/Leads/{lead_id}"
-        requests.put(url, headers=zoho_headers(), json={"data": [payload]}, timeout=20)
+        r = requests.put(url, headers=zoho_headers(), json={"data": [payload]}, timeout=20)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Failed to update lead: {r.status_code} {r.text}")
         return lead_id
 
     url = f"{ZOHO_BASE}/Leads"
@@ -127,15 +118,10 @@ def upsert_lead(full_name: str, phone: str, psid: str) -> str:
         raise RuntimeError(f"Failed to create lead: {r.status_code} {r.text}")
     return r.json()["data"][0]["details"]["id"]
 
-# ---------- DEALS ----------
-
 def _pick_agent_id(psid: str) -> Optional[str]:
-    """
-    Deterministic assignment: same PSID -> same agent (stable).
-    Only works if AGENT_IDS is provided.
-    """
     if not AGENT_IDS:
         return None
+    # stable assignment for a given psid
     idx = sum(psid.encode("utf-8")) % len(AGENT_IDS)
     return AGENT_IDS[idx]
 
@@ -157,6 +143,8 @@ def create_deal(lead_id: str, trip: dict, booking_ref: str, owner_id: Optional[s
         "Pipeline": "Flight Booking",
         "Stage": "New Lead",
         "Amount": 0,
+        # NOTE: In some Bigin setups, "Contact_Name" expects a Contact ID, not a Lead ID.
+        # If your org rejects this, we will change it to a lead-linked field or create a Contact.
         "Contact_Name": {"id": lead_id},
         "Description": description
     }
@@ -166,10 +154,8 @@ def create_deal(lead_id: str, trip: dict, booking_ref: str, owner_id: Optional[s
 
     url = f"{ZOHO_BASE}/Deals"
     r = requests.post(url, headers=zoho_headers(), json={"data": [payload]}, timeout=20)
-
     if r.status_code >= 400:
-        print("[Zoho Deal ERROR]", r.text)
-        raise RuntimeError("Failed to create deal")
+        raise RuntimeError(f"Failed to create deal: {r.status_code} {r.text}")
 
     return r.json()["data"][0]["details"]["id"]
 
@@ -181,8 +167,6 @@ def update_deal(deal_id: str, payload: dict) -> dict:
     except Exception:
         j = {"raw_text": r.text}
     return {"status_code": r.status_code, "body": j}
-
-# ---------- NOTES ----------
 
 def add_deal_note(deal_id: str, note_text: str) -> dict:
     payload = {
@@ -200,21 +184,17 @@ def add_deal_note(deal_id: str, note_text: str) -> dict:
     return {"status_code": r.status_code, "body": j}
 
 # =========================================================
-# PRICING (stub now -> your scraper later)
+# PRICING (stub now -> swap with Amadeus scraper later)
 # =========================================================
-
 def fetch_exact_price(origin: str, dest: str, depart_date: str, return_date: Optional[str],
                       airline_pref: Optional[str], pax: Dict[str, int]) -> Dict[str, Any]:
-    """
-    Hook to your scraper/API. Replace this stub with Amadeus scraper/Enterprise API.
-    """
     base_total_doc_adult = 800.0
     tax_adult = 200.0
-    adults = pax.get("adults", 1)
 
+    adults = pax.get("adults", 1)
     total_doc = base_total_doc_adult * adults
     tax_total = tax_adult * adults
-    airline_code = airline_pref or "626"  # default to PX mapping in your world
+    airline_code = airline_pref or "626"
 
     return {
         "AIRLINE": airline_code,
@@ -230,13 +210,6 @@ def generate_booking_ref() -> str:
     return f"ET-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
 
 def process_booking_flow(psid: str, session: dict) -> dict:
-    """
-    1) Upsert Lead
-    2) Create Deal (Flight Booking -> New Lead)
-    3) Add Note
-    4) Price -> compute_pricing -> update Deal Amount -> move stage
-    5) Return booking_ref + quote_total
-    """
     booking_ref = generate_booking_ref()
 
     try:
@@ -257,10 +230,8 @@ def process_booking_flow(psid: str, session: dict) -> dict:
             pax=pax
         )
 
-        # Try your pricing_rules function; keep it robust to different output shapes
         priced = compute_pricing(raw, convenience_fee_pct=CONVENIENCE_FEE_PCT, commission_map=COMMISSION_MAP)
 
-        # Try common keys; fallback to raw TOTAL_DOC
         quote_total = (
             priced.get("TOTAL_CUSTOMER")
             or priced.get("TOTAL")
@@ -295,9 +266,8 @@ def process_booking_flow(psid: str, session: dict) -> dict:
         return {"ok": False, "error": str(e), "booking_ref": booking_ref}
 
 # =========================================================
-# MESSENGER BOOKING QUESTION FLOW
+# SIMPLE BOOKING QUESTION FLOW (Messenger -> session)
 # =========================================================
-
 def _init_session() -> dict:
     return {
         "step": "name",
@@ -316,7 +286,7 @@ def _init_session() -> dict:
 def handle_message(psid: str, text: str) -> None:
     session = SESSIONS.get(psid)
 
-    # Start a new flow if none exists or user says "start"
+    # Start a new flow if none exists or user says start-like words
     if session is None or text.strip().lower() in ("start", "book", "booking", "flight", "hi", "hello"):
         session = _init_session()
         SESSIONS[psid] = session
@@ -389,7 +359,6 @@ def handle_message(psid: str, text: str) -> None:
         else:
             session["airline_pref"] = None
 
-        # run flow
         send_message(psid, "✅ Got it. Saving your request and preparing an estimate…")
         result = process_booking_flow(psid, session)
 
@@ -402,22 +371,24 @@ def handle_message(psid: str, text: str) -> None:
                 f"Our consultant will contact you shortly."
             )
         else:
-            send_message(psid, f"⚠️ Sorry—something went wrong.\nRef: {result.get('booking_ref')}\nPlease type START and try again.")
+            send_message(
+                psid,
+                f"⚠️ Sorry—something went wrong.\nRef: {result.get('booking_ref')}\n"
+                f"Please type START and try again."
+            )
             print("[BOOKING FLOW ERROR]", result)
 
-        # clear session
         SESSIONS.pop(psid, None)
         return
 
-    # fallback
     send_message(psid, "Type START to begin a new flight booking request.")
 
 # =========================================================
 # MESSENGER WEBHOOK ROUTES
 # =========================================================
-
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
+    # Meta verification
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
@@ -429,17 +400,21 @@ def verify_webhook():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
+    print("[WEBHOOK POST] received")
 
+    # Messenger events
     for entry in data.get("entry", []):
         for event in entry.get("messaging", []):
             psid = event.get("sender", {}).get("id")
             msg = event.get("message", {})
+
             if not psid:
                 continue
+
             # ignore echoes
             if msg.get("is_echo"):
                 continue
-            # only handle text for now
+
             text = (msg.get("text") or "").strip()
             if text:
                 handle_message(psid, text)
