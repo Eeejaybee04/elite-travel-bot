@@ -10,6 +10,9 @@ import requests
 
 from zoho_auth import get_access_token
 from pricing_rules import compute_pricing
+PROCESSED_MIDS = set()
+from typing import Dict, Any, Optional
+import requests
 
 app = Flask(__name__)
 
@@ -82,40 +85,43 @@ def split_name(full_name: str) -> Tuple[str, str]:
         return "", parts[0]  # Zoho requires Last_Name
     return " ".join(parts[:-1]), parts[-1]
 
-def find_lead_by_phone(phone: str) -> Optional[dict]:
-    url = f"{ZOHO_BASE}/Leads/search"
+def find_contact_by_phone(phone: str) -> Optional[dict]:
+    # Bigin uses Contacts, not Leads
+    url = f"{ZOHO_BASE}/Contacts/search"
     params = {"criteria": f"(Mobile:equals:{phone})"}
     r = requests.get(url, headers=zoho_headers(), params=params, timeout=20)
+
     if r.status_code == 200:
         j = r.json()
         if j.get("data"):
             return j["data"][0]
     return None
 
-def upsert_lead(full_name: str, phone: str, psid: str) -> str:
-    existing = find_lead_by_phone(phone)
+
+def upsert_contact(full_name: str, phone: str, psid: str) -> str:
+    existing = find_contact_by_phone(phone)
     first, last = split_name(full_name)
 
     payload = {
         "First_Name": first,
-        "Last_Name": last or "Unknown",
+        "Last_Name": last or "Unknown",   # required
         "Mobile": phone,
-        "Lead_Source": "Facebook Messenger",
         "Description": f"Messenger PSID: {psid}"
     }
 
     if existing:
-        lead_id = existing["id"]
-        url = f"{ZOHO_BASE}/Leads/{lead_id}"
+        contact_id = existing["id"]
+        url = f"{ZOHO_BASE}/Contacts/{contact_id}"
         r = requests.put(url, headers=zoho_headers(), json={"data": [payload]}, timeout=20)
         if r.status_code >= 400:
-            raise RuntimeError(f"Failed to update lead: {r.status_code} {r.text}")
-        return lead_id
+            raise RuntimeError(f"Failed to update contact: {r.status_code} {r.text}")
+        return contact_id
 
-    url = f"{ZOHO_BASE}/Leads"
+    url = f"{ZOHO_BASE}/Contacts"
     r = requests.post(url, headers=zoho_headers(), json={"data": [payload]}, timeout=20)
     if r.status_code >= 400:
-        raise RuntimeError(f"Failed to create lead: {r.status_code} {r.text}")
+        raise RuntimeError(f"Failed to create contact: {r.status_code} {r.text}")
+
     return r.json()["data"][0]["details"]["id"]
 
 def _pick_agent_id(psid: str) -> Optional[str]:
@@ -125,63 +131,61 @@ def _pick_agent_id(psid: str) -> Optional[str]:
     idx = sum(psid.encode("utf-8")) % len(AGENT_IDS)
     return AGENT_IDS[idx]
 
-def create_deal(lead_id: str, trip: dict, booking_ref: str, owner_id: Optional[str] = None) -> str:
+def create_deal(
+    contact_id: str,
+    trip: dict,
+    booking_ref: str,
+    owner_id: Optional[str] = None,
+    estimate_low: Optional[float] = None,
+    estimate_high: Optional[float] = None,
+    estimate_source: str = "Amadeus Self-Service API",
+) -> str:
     deal_name = f'{trip["origin"]}-{trip["destination"]} | {trip["depart_date"]} | {booking_ref}'
 
-    description = (
-        f"Booking Ref: {booking_ref}\n"
-        f"Route: {trip['origin']}-{trip['destination']}\n"
-        f"Depart: {trip['depart_date']}\n"
-        f"Return: {trip.get('return_date', 'One-way')}\n"
-        f"PAX: A{trip['adults']} C{trip['children']} I{trip['infants']}\n"
-        f"Preferred Airline: {trip.get('airline_pref') or 'Any'}\n"
-        f"Source: Messenger"
-    )
+    description_lines = [
+        f"Booking Ref: {booking_ref}",
+        f"Route: {trip['origin']}-{trip['destination']}",
+        f"Depart: {trip['depart_date']}",
+        f"Return: {trip.get('return_date', 'One-way')}",
+        f"PAX: A{trip['adults']} C{trip['children']} I{trip['infants']}",
+        f"Preferred Airline: {trip.get('airline_pref') or 'Any'}",
+        f"Source: Messenger",
+    ]
+
+    if estimate_low is not None and estimate_high is not None:
+        description_lines += [
+            "",
+            f"ESTIMATE RANGE (incl. fees): {estimate_low:.2f} - {estimate_high:.2f}",
+            f"Estimate Source: {estimate_source}",
+        ]
+
+    description = "\n".join(description_lines)
 
     payload: Dict[str, Any] = {
         "Deal_Name": deal_name,
         "Pipeline": "Flight Booking",
         "Stage": "New Lead",
-        "Amount": 0,
-        # NOTE: In some Bigin setups, "Contact_Name" expects a Contact ID, not a Lead ID.
-        # If your org rejects this, we will change it to a lead-linked field or create a Contact.
-        "Contact_Name": {"id": lead_id},
-        "Description": description
+        "Amount": 0,  # keep 0 until agent confirms final price
+        "Contact_Name": {"id": contact_id},
+        "Description": description,
     }
 
     if owner_id:
         payload["Owner"] = {"id": owner_id}
 
+    # ✅ If you create custom fields in Bigin Deals, you can store estimates properly:
+    # Example API names (YOU must replace with your real API field names):
+    # payload["Estimated_Low"] = estimate_low
+    # payload["Estimated_High"] = estimate_high
+
     url = f"{ZOHO_BASE}/Deals"
     r = requests.post(url, headers=zoho_headers(), json={"data": [payload]}, timeout=20)
+
     if r.status_code >= 400:
         raise RuntimeError(f"Failed to create deal: {r.status_code} {r.text}")
 
-    return r.json()["data"][0]["details"]["id"]
-
-def update_deal(deal_id: str, payload: dict) -> dict:
-    url = f"{ZOHO_BASE}/Deals/{deal_id}"
-    r = requests.put(url, headers=zoho_headers(), json={"data": [payload]}, timeout=20)
-    try:
-        j = r.json()
-    except Exception:
-        j = {"raw_text": r.text}
-    return {"status_code": r.status_code, "body": j}
-
-def add_deal_note(deal_id: str, note_text: str) -> dict:
-    payload = {
-        "Note_Title": "Messenger Enquiry",
-        "Note_Content": note_text,
-        "Parent_Id": deal_id,
-        "se_module": "Deals"
-    }
-    url = f"{ZOHO_BASE}/Notes"
-    r = requests.post(url, headers=zoho_headers(), json={"data": [payload]}, timeout=20)
-    try:
-        j = r.json()
-    except Exception:
-        j = {"raw_text": r.text}
-    return {"status_code": r.status_code, "body": j}
+    j = r.json()
+    return j["data"][0]["details"]["id"]
 
 # =========================================================
 # PRICING (stub now -> swap with Amadeus scraper later)
@@ -213,10 +217,10 @@ def process_booking_flow(psid: str, session: dict) -> dict:
     booking_ref = generate_booking_ref()
 
     try:
-        lead_id = upsert_lead(full_name=session["name"], phone=session["phone"], psid=psid)
+        contact_id = upsert_contact(full_name=session["name"], phone=session["phone"], psid=psid)
 
         owner_id = _pick_agent_id(psid)
-        deal_id = create_deal(lead_id=lead_id, trip=session, booking_ref=booking_ref, owner_id=owner_id)
+        deal_id = create_deal(contact_id=contact_id, trip=session, booking_ref=booking_ref, owner_id=owner_id)
 
         add_deal_note(deal_id, f"Messenger session:\n{json.dumps(session, indent=2)}")
 
@@ -411,9 +415,12 @@ def webhook():
             if not psid:
                 continue
 
-            # ignore echoes
-            if msg.get("is_echo"):
-                continue
+            # ✅ de-dupe
+            mid = msg.get("mid")
+            if mid:
+                if mid in PROCESSED_MIDS:
+                    continue
+                PROCESSED_MIDS.add(mid)
 
             text = (msg.get("text") or "").strip()
             if text:
